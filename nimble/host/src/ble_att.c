@@ -24,45 +24,60 @@
 static uint16_t ble_att_preferred_mtu_val;
 
 /** Dispatch table for incoming ATT requests.  Sorted by op code. */
-typedef int ble_att_rx_fn(uint16_t conn_handle, struct os_mbuf **om);
-struct ble_att_rx_dispatch_entry {
+typedef int ble_att_rx_req_fn(struct ble_l2cap_chan* chan, struct os_mbuf **om);
+struct ble_att_rx_req_dispatch_entry {
     uint8_t bde_op;
-    ble_att_rx_fn *bde_fn;
+    ble_att_rx_req_fn *bde_fn;
+};
+
+static const struct ble_att_rx_req_dispatch_entry ble_att_rx_req_dispatch[] = {
+    { BLE_ATT_OP_MTU_REQ,              ble_att_svr_rx_mtu },
+    { BLE_ATT_OP_FIND_INFO_REQ,        ble_att_svr_rx_find_info },
+    { BLE_ATT_OP_FIND_TYPE_VALUE_REQ,  ble_att_svr_rx_find_type_value },
+    { BLE_ATT_OP_READ_TYPE_REQ,        ble_att_svr_rx_read_type },
+    { BLE_ATT_OP_READ_REQ,             ble_att_svr_rx_read },
+    { BLE_ATT_OP_READ_BLOB_REQ,        ble_att_svr_rx_read_blob },
+    { BLE_ATT_OP_READ_MULT_REQ,        ble_att_svr_rx_read_mult },
+    { BLE_ATT_OP_READ_GROUP_TYPE_REQ,  ble_att_svr_rx_read_group_type },
+    { BLE_ATT_OP_WRITE_REQ,            ble_att_svr_rx_write },
+    { BLE_ATT_OP_PREP_WRITE_REQ,       ble_att_svr_rx_prep_write },
+    { BLE_ATT_OP_EXEC_WRITE_REQ,       ble_att_svr_rx_exec_write },
+    { BLE_ATT_OP_INDICATE_REQ,         ble_att_svr_rx_indicate },
+};
+
+/** Dispatch table for incoming ATT Responses.  Sorted by op code. */
+typedef int ble_att_rx_rsp_fn(uint16_t conn_handle, struct os_mbuf **om);
+struct ble_att_rx_rsp_dispatch_entry {
+    uint8_t bde_op;
+    ble_att_rx_rsp_fn *bde_fn;
 };
 
 /** Dispatch table for incoming ATT commands.  Must be ordered by op code. */
-static const struct ble_att_rx_dispatch_entry ble_att_rx_dispatch[] = {
+static const struct ble_att_rx_rsp_dispatch_entry ble_att_rx_rsp_dispatch[] = {
     { BLE_ATT_OP_ERROR_RSP,            ble_att_clt_rx_error },
-    { BLE_ATT_OP_MTU_REQ,              ble_att_svr_rx_mtu },
     { BLE_ATT_OP_MTU_RSP,              ble_att_clt_rx_mtu },
-    { BLE_ATT_OP_FIND_INFO_REQ,        ble_att_svr_rx_find_info },
     { BLE_ATT_OP_FIND_INFO_RSP,        ble_att_clt_rx_find_info },
-    { BLE_ATT_OP_FIND_TYPE_VALUE_REQ,  ble_att_svr_rx_find_type_value },
     { BLE_ATT_OP_FIND_TYPE_VALUE_RSP,  ble_att_clt_rx_find_type_value },
-    { BLE_ATT_OP_READ_TYPE_REQ,        ble_att_svr_rx_read_type },
     { BLE_ATT_OP_READ_TYPE_RSP,        ble_att_clt_rx_read_type },
-    { BLE_ATT_OP_READ_REQ,             ble_att_svr_rx_read },
     { BLE_ATT_OP_READ_RSP,             ble_att_clt_rx_read },
-    { BLE_ATT_OP_READ_BLOB_REQ,        ble_att_svr_rx_read_blob },
     { BLE_ATT_OP_READ_BLOB_RSP,        ble_att_clt_rx_read_blob },
-    { BLE_ATT_OP_READ_MULT_REQ,        ble_att_svr_rx_read_mult },
     { BLE_ATT_OP_READ_MULT_RSP,        ble_att_clt_rx_read_mult },
-    { BLE_ATT_OP_READ_GROUP_TYPE_REQ,  ble_att_svr_rx_read_group_type },
     { BLE_ATT_OP_READ_GROUP_TYPE_RSP,  ble_att_clt_rx_read_group_type },
-    { BLE_ATT_OP_WRITE_REQ,            ble_att_svr_rx_write },
     { BLE_ATT_OP_WRITE_RSP,            ble_att_clt_rx_write },
-    { BLE_ATT_OP_PREP_WRITE_REQ,       ble_att_svr_rx_prep_write },
     { BLE_ATT_OP_PREP_WRITE_RSP,       ble_att_clt_rx_prep_write },
-    { BLE_ATT_OP_EXEC_WRITE_REQ,       ble_att_svr_rx_exec_write },
     { BLE_ATT_OP_EXEC_WRITE_RSP,       ble_att_clt_rx_exec_write },
+    /* Notify is considered as rx because it has no response */
     { BLE_ATT_OP_NOTIFY_REQ,           ble_att_svr_rx_notify },
-    { BLE_ATT_OP_INDICATE_REQ,         ble_att_svr_rx_indicate },
     { BLE_ATT_OP_INDICATE_RSP,         ble_att_clt_rx_indicate },
+    /* WRITE_CMD is considered as rx because it has no response */
     { BLE_ATT_OP_WRITE_CMD,            ble_att_svr_rx_write_no_rsp },
 };
 
-#define BLE_ATT_RX_DISPATCH_SZ \
-    (sizeof ble_att_rx_dispatch / sizeof ble_att_rx_dispatch[0])
+#define BLE_ATT_RX_REQ_DISPATCH_SZ \
+    (sizeof ble_att_rx_req_dispatch / sizeof ble_att_rx_req_dispatch[0])
+
+#define BLE_ATT_RX_RSP_DISPATCH_SZ \
+    (sizeof ble_att_rx_rsp_dispatch / sizeof ble_att_rx_rsp_dispatch[0])
 
 STATS_SECT_DECL(ble_att_stats) ble_att_stats;
 STATS_NAME_START(ble_att_stats)
@@ -122,14 +137,34 @@ STATS_NAME_START(ble_att_stats)
     STATS_NAME(ble_att_stats, write_cmd_tx)
 STATS_NAME_END(ble_att_stats)
 
-static const struct ble_att_rx_dispatch_entry *
-ble_att_rx_dispatch_entry_find(uint8_t op)
+static const struct ble_att_rx_req_dispatch_entry *
+ble_att_rx_req_dispatch_entry_find(uint8_t op)
 {
-    const struct ble_att_rx_dispatch_entry *entry;
+    const struct ble_att_rx_req_dispatch_entry *entry;
     int i;
 
-    for (i = 0; i < BLE_ATT_RX_DISPATCH_SZ; i++) {
-        entry = ble_att_rx_dispatch + i;
+    for (i = 0; i < BLE_ATT_RX_REQ_DISPATCH_SZ; i++) {
+        entry = ble_att_rx_req_dispatch + i;
+        if (entry->bde_op == op) {
+            return entry;
+        }
+
+        if (entry->bde_op > op) {
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+static const struct ble_att_rx_rsp_dispatch_entry *
+ble_att_rx_rsp_dispatch_entry_find(uint8_t op)
+{
+    const struct ble_att_rx_rsp_dispatch_entry *entry;
+    int i;
+
+    for (i = 0; i < BLE_ATT_RX_RSP_DISPATCH_SZ; i++) {
+        entry = ble_att_rx_rsp_dispatch + i;
         if (entry->bde_op == op) {
             return entry;
         }
@@ -438,8 +473,8 @@ ble_att_chan_mtu(const struct ble_l2cap_chan *chan)
     /* If either side has not exchanged MTU size, use the default.  Otherwise,
      * use the lesser of the two exchanged values.
      */
-    if (!(ble_l2cap_is_mtu_req_sent(chan)) ||
-        chan->peer_mtu == 0) {
+    if ((chan->dcid == BLE_L2CAP_CID_ATT) &&
+        (!(ble_l2cap_is_mtu_req_sent(chan)) || chan->peer_mtu == 0)) {
 
         mtu = BLE_ATT_MTU_DFLT;
     } else {
@@ -452,7 +487,7 @@ ble_att_chan_mtu(const struct ble_l2cap_chan *chan)
 }
 
 static void
-ble_att_rx_handle_unknown_request(uint8_t op, uint16_t conn_handle,
+ble_att_rx_handle_unknown_request(uint8_t op, struct ble_l2cap_chan *chan,
                                   struct os_mbuf **om)
 {
     /* If this is command (bit6 is set to 1), do nothing */
@@ -461,7 +496,7 @@ ble_att_rx_handle_unknown_request(uint8_t op, uint16_t conn_handle,
     }
 
     os_mbuf_adj(*om, OS_MBUF_PKTLEN(*om));
-    ble_att_svr_tx_error_rsp(conn_handle, *om, op, 0,
+    ble_att_svr_tx_error_rsp(chan, *om, op, 0,
                              BLE_ATT_ERR_REQ_NOT_SUPPORTED);
 
     *om = NULL;
@@ -470,7 +505,8 @@ ble_att_rx_handle_unknown_request(uint8_t op, uint16_t conn_handle,
 static int
 ble_att_rx(struct ble_l2cap_chan *chan)
 {
-    const struct ble_att_rx_dispatch_entry *entry;
+    const struct ble_att_rx_req_dispatch_entry *entry_req;
+    const struct ble_att_rx_rsp_dispatch_entry *entry_rsp;
     uint8_t op;
     uint16_t conn_handle;
     struct os_mbuf **om;
@@ -489,21 +525,36 @@ ble_att_rx(struct ble_l2cap_chan *chan)
         return BLE_HS_EMSGSIZE;
     }
 
-    entry = ble_att_rx_dispatch_entry_find(op);
-    if (entry == NULL) {
-        ble_att_rx_handle_unknown_request(op, conn_handle, om);
-        return BLE_HS_ENOTSUP;
-    }
-
     ble_att_inc_rx_stat(op);
 
     /* Strip L2CAP ATT header from the front of the mbuf. */
     os_mbuf_adj(*om, 1);
 
-    rc = entry->bde_fn(conn_handle, om);
+    if (ble_att_is_atomic_transaction(op)) {
+        /* Set Att Bearer as Busy */
+        chan->flags |= BLE_L2CAP_CHAN_BUSY;
+
+        entry_req = ble_att_rx_req_dispatch_entry_find(op);
+        if (entry_req == NULL) {
+            ble_att_rx_handle_unknown_request(op, chan, om);
+            return BLE_HS_ENOTSUP;
+        }
+        rc = entry_req->bde_fn(chan, om);
+    } else {
+        /* Clear Busy Flag of the L2CAP Channel */
+        chan->flags &= ~(BLE_L2CAP_CHAN_BUSY);
+
+        entry_rsp = ble_att_rx_rsp_dispatch_entry_find(op);
+        if (entry_rsp == NULL) {
+            ble_att_rx_handle_unknown_request(op, chan, om);
+            return BLE_HS_ENOTSUP;
+        }
+        rc = entry_rsp->bde_fn(conn_handle, om);
+    }
+
     if (rc != 0) {
         if (rc == BLE_HS_ENOTSUP) {
-            ble_att_rx_handle_unknown_request(op, conn_handle, om);
+            ble_att_rx_handle_unknown_request(op, chan, om);
         }
         return rc;
     }
@@ -569,6 +620,39 @@ ble_att_create_chan(uint16_t conn_handle)
     chan->rx_fn = ble_att_rx;
 
     return chan;
+}
+
+int
+ble_att_is_busy(uint16_t conn_handle) 
+{
+    struct ble_l2cap_chan *chan;
+    struct ble_hs_conn *conn;
+    ble_hs_lock();
+    ble_att_conn_chan_find(conn_handle, &conn, &chan);
+    ble_hs_unlock();
+    return (chan->flags & BLE_L2CAP_CHAN_BUSY)? BLE_HS_EBUSY : 0 ;
+}
+
+int
+ble_att_is_atomic_transaction(uint8_t opcode)
+{
+    switch(opcode) {
+        case BLE_ATT_OP_MTU_REQ:
+        case BLE_ATT_OP_FIND_INFO_REQ:
+        case BLE_ATT_OP_FIND_TYPE_VALUE_REQ:
+        case BLE_ATT_OP_READ_TYPE_REQ:
+        case BLE_ATT_OP_READ_REQ:
+        case BLE_ATT_OP_READ_BLOB_REQ:
+        case BLE_ATT_OP_READ_MULT_REQ:
+        case BLE_ATT_OP_READ_GROUP_TYPE_REQ:
+        case BLE_ATT_OP_WRITE_REQ:
+        case BLE_ATT_OP_PREP_WRITE_REQ:
+        case BLE_ATT_OP_EXEC_WRITE_REQ:
+        case BLE_ATT_OP_INDICATE_REQ:
+            return 1;
+        default:
+            return 0;
+    }
 }
 
 int

@@ -90,6 +90,8 @@
 
 /** Procedure stalled due to resource exhaustion. */
 #define BLE_GATTC_PROC_F_STALLED                0x01
+/** Procedure Queued due to Att Busy . */
+#define BLE_GATTC_PROC_F_QUEUED                 0x02
 
 /** Represents an in-progress GATT procedure. */
 struct ble_gattc_proc {
@@ -183,6 +185,7 @@ struct ble_gattc_proc {
 
         struct {
             uint16_t att_handle;
+            struct os_mbuf *om;
             ble_gatt_attr_fn *cb;
             void *cb_arg;
         } write;
@@ -205,11 +208,16 @@ struct ble_gattc_proc {
 
         struct {
             uint16_t chr_val_handle;
+            struct os_mbuf *om;
         } indicate;
     };
 };
 
 STAILQ_HEAD(ble_gattc_proc_list, ble_gattc_proc);
+
+static void ble_gattc_process_queued_procs(struct ble_gattc_proc *proc);
+static struct ble_gattc_proc *
+ble_gattc_extract_first_by_conn_flag(uint16_t conn_handle, uint8_t flag);
 
 /**
  * Error functions - these handle an incoming ATT error response and apply it
@@ -696,6 +704,10 @@ ble_gattc_proc_free(struct ble_gattc_proc *proc)
         ble_gattc_dbg_assert_proc_not_inserted(proc);
 
         switch (proc->op) {
+        case BLE_GATT_OP_WRITE:
+            os_mbuf_free_chain(proc->write.om);
+            break;
+
         case BLE_GATT_OP_WRITE_LONG:
             os_mbuf_free_chain(proc->write_long.attr.om);
             break;
@@ -704,6 +716,10 @@ ble_gattc_proc_free(struct ble_gattc_proc *proc)
             for (i = 0; i < proc->write_reliable.num_attrs; i++) {
                 os_mbuf_free_chain(proc->write_reliable.attrs[i].om);
             }
+            break;
+
+        case BLE_GATT_OP_INDICATE:
+            os_mbuf_free_chain(proc->indicate.om);
             break;
 
         default:
@@ -757,6 +773,7 @@ ble_gattc_proc_set_resume_timer(struct ble_gattc_proc *proc)
 static void
 ble_gattc_process_status(struct ble_gattc_proc *proc, int status)
 {
+    struct ble_gattc_proc *proc_queued;
     switch (status) {
     case 0:
         if (!(proc->flags & BLE_GATTC_PROC_F_STALLED)) {
@@ -766,7 +783,26 @@ ble_gattc_process_status(struct ble_gattc_proc *proc, int status)
         ble_gattc_proc_insert(proc);
         ble_hs_timer_resched();
         break;
-
+		
+    case BLE_HS_EBUSY:
+        /* Queue the Procedure in case Att Bearer is busy with transaction */
+        proc->flags |= BLE_GATTC_PROC_F_QUEUED;
+        ble_gattc_proc_insert(proc);
+        break;
+		
+    case BLE_HS_EDONE:
+        /* The Current Procedure has been finished, check if there is a queued
+         * procedure and start it */
+        proc_queued = ble_gattc_extract_first_by_conn_flag(proc->conn_handle,
+                BLE_GATTC_PROC_F_QUEUED);
+        ble_gattc_proc_free(proc);
+        /* Process Queued Procedure */
+        if(proc_queued) {
+            proc_queued->flags &= ~BLE_GATTC_PROC_F_QUEUED;
+            ble_gattc_process_queued_procs(proc_queued);
+        }
+        break;
+		
     default:
         ble_gattc_proc_free(proc);
         break;
@@ -861,6 +897,38 @@ ble_gattc_proc_matches_conn_op(struct ble_gattc_proc *proc, void *arg)
     return 1;
 }
 
+struct ble_gattc_criteria_conn_flag {
+    uint16_t conn_handle;
+    uint8_t flag;
+};
+
+/**
+ * Tests if a proc entry fits the specified criteria.
+ *
+ * @param proc                  The procedure to test.
+ * @param conn_handle           The connection handle to match against.
+ * @param flag                  The flag to match against
+ *
+ * @return                      1 if the proc matches; 0 otherwise.
+ */
+static int
+ble_gattc_proc_matches_conn_flag(struct ble_gattc_proc *proc, void *arg)
+{
+    const struct ble_gattc_criteria_conn_flag *criteria;
+
+    criteria = arg;
+
+    if (criteria->conn_handle != proc->conn_handle) {
+        return 0;
+    }
+
+    if (criteria->flag != proc->flags ) {
+        return 0;
+    }
+
+    return 1;
+}
+
 struct ble_gattc_criteria_exp {
     ble_npl_time_t now;
     int32_t next_exp_in;
@@ -873,6 +941,13 @@ ble_gattc_proc_matches_expired(struct ble_gattc_proc *proc, void *arg)
     int32_t time_diff;
 
     criteria = arg;
+
+    /* Queued Procedures are not expired,
+     * They are not started at the first place
+     * */
+    if(proc->flags & BLE_GATTC_PROC_F_QUEUED) {
+        return 0;
+    }
 
     time_diff = proc->exp_os_ticks - criteria->now;
 
@@ -1001,6 +1076,17 @@ static void
 ble_gattc_extract_stalled(struct ble_gattc_proc_list *dst_list)
 {
     ble_gattc_extract(ble_gattc_proc_matches_stalled, NULL, 0, dst_list);
+}
+
+static struct ble_gattc_proc *
+ble_gattc_extract_first_by_conn_flag(uint16_t conn_handle, uint8_t flag)
+{
+    struct ble_gattc_criteria_conn_flag criteria;
+
+    criteria.conn_handle = conn_handle;
+    criteria.flag = flag;
+
+    return ble_gattc_extract_one(ble_gattc_proc_matches_conn_flag, &criteria);
 }
 
 /**
@@ -1309,17 +1395,27 @@ ble_gattc_exchange_mtu(uint16_t conn_handle, ble_gatt_mtu_fn *cb, void *cb_arg)
 
     ble_gattc_log_proc_init("exchange mtu\n");
 
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_mtu_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, mtu_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -1534,17 +1630,28 @@ ble_gattc_disc_all_svcs(uint16_t conn_handle, ble_gatt_disc_svc_fn *cb,
 
     ble_gattc_log_proc_init("discover all services\n");
 
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_disc_all_svcs_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, disc_all_svcs_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -1748,17 +1855,28 @@ ble_gattc_disc_svc_by_uuid(uint16_t conn_handle, const ble_uuid_t *uuid,
 
     ble_gattc_log_disc_svc_uuid(proc);
 
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_disc_svc_uuid_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, disc_svc_uuid_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -2064,17 +2182,28 @@ ble_gattc_find_inc_svcs(uint16_t conn_handle, uint16_t start_handle,
 
     ble_gattc_log_find_inc_svcs(proc);
 
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_find_inc_svcs_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, find_inc_svcs_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -2292,17 +2421,27 @@ ble_gattc_disc_all_chrs(uint16_t conn_handle, uint16_t start_handle,
 
     ble_gattc_log_disc_all_chrs(proc);
 
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_disc_all_chrs_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, disc_all_chrs_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -2532,17 +2671,28 @@ ble_gattc_disc_chrs_by_uuid(uint16_t conn_handle, uint16_t start_handle,
 
     ble_gattc_log_disc_chr_uuid(proc);
 
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_disc_chr_uuid_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, disc_chrs_uuid_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -2742,17 +2892,28 @@ ble_gattc_disc_all_dscs(uint16_t conn_handle, uint16_t start_handle,
 
     ble_gattc_log_disc_all_dscs(proc);
 
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_disc_all_dscs_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, disc_all_dscs_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -2877,17 +3038,29 @@ ble_gattc_read(uint16_t conn_handle, uint16_t attr_handle,
     proc->read.cb_arg = cb_arg;
 
     ble_gattc_log_read(attr_handle);
+
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_read_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, read_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -3041,17 +3214,29 @@ ble_gattc_read_by_uuid(uint16_t conn_handle, uint16_t start_handle,
     proc->read_uuid.cb_arg = cb_arg;
 
     ble_gattc_log_read_uuid(start_handle, end_handle, uuid);
+
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_read_uuid_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, read_uuid_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -3237,17 +3422,28 @@ ble_gattc_read_long(uint16_t conn_handle, uint16_t handle, uint16_t offset,
 
     ble_gattc_log_read_long(proc);
 
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_read_long_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, read_long_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -3372,17 +3568,29 @@ ble_gattc_read_mult(uint16_t conn_handle, const uint16_t *handles,
     proc->read_mult.cb_arg = cb_arg;
 
     ble_gattc_log_read_mult(handles, num_handles);
+
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_read_mult_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, read_mult_fail);
     }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -3513,10 +3721,17 @@ ble_gattc_write(uint16_t conn_handle, uint16_t attr_handle,
     proc->op = BLE_GATT_OP_WRITE;
     proc->conn_handle = conn_handle;
     proc->write.att_handle = attr_handle;
+    proc->write.om = txom;
     proc->write.cb = cb;
     proc->write.cb_arg = cb_arg;
 
     ble_gattc_log_write(attr_handle, OS_MBUF_PKTLEN(txom), 1);
+
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
 
     rc = ble_att_clt_tx_write_req(conn_handle, attr_handle, txom);
     txom = NULL;
@@ -3525,14 +3740,18 @@ ble_gattc_write(uint16_t conn_handle, uint16_t attr_handle,
     }
 
 done:
-    if (rc != 0) {
-        STATS_INC(ble_gattc_stats, write_fail);
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
     }
 
-    /* Free the mbuf in case the send failed. */
-    os_mbuf_free_chain(txom);
+    if (rc != 0) {
+        STATS_INC(ble_gattc_stats, write_fail);
+        /* Free the mbuf in case the send failed. */
+        os_mbuf_free_chain(txom);
+    }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -3833,20 +4052,30 @@ ble_gattc_write_long(uint16_t conn_handle, uint16_t attr_handle,
 
     ble_gattc_log_write_long(proc);
 
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_write_long_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
-    if (rc != 0) {
-        STATS_INC(ble_gattc_stats, write_long_fail);
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
     }
 
-    /* Free the mbuf in case of failure. */
-    os_mbuf_free_chain(txom);
+    if (rc != 0) {
+        STATS_INC(ble_gattc_stats, write_long_fail);
+        /* Free the mbuf in case of failure. */
+        os_mbuf_free_chain(txom);
+    }
 
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -4119,23 +4348,34 @@ ble_gattc_write_reliable(uint16_t conn_handle,
     }
 
     ble_gattc_log_write_reliable(proc);
+
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_gattc_write_reliable_tx(proc);
     if (rc != 0) {
         goto done;
     }
 
 done:
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    }
+
     if (rc != 0) {
         STATS_INC(ble_gattc_stats, write_reliable_fail);
+        /* Free supplied mbufs in case something failed. */
+        for (i = 0; i < num_attrs; i++) {
+            os_mbuf_free_chain(attrs[i].om);
+            attrs[i].om = NULL;
+        }
     }
 
-    /* Free supplied mbufs in case something failed. */
-    for (i = 0; i < num_attrs; i++) {
-        os_mbuf_free_chain(attrs[i].om);
-        attrs[i].om = NULL;
-    }
-
-    ble_gattc_process_status(proc, rc);
     return rc;
 }
 
@@ -4333,6 +4573,14 @@ ble_gattc_indicate_custom(uint16_t conn_handle, uint16_t chr_val_handle,
         }
     }
 
+    proc->indicate.om = txom;
+
+    /* Check if the Att Bearer is busy */
+    rc = ble_att_is_busy(conn_handle);
+    if (rc != 0) {
+        goto done;
+    }
+
     rc = ble_att_clt_tx_indicate(conn_handle, chr_val_handle, txom);
     txom = NULL;
     if (rc != 0) {
@@ -4348,15 +4596,20 @@ ble_gattc_indicate_custom(uint16_t conn_handle, uint16_t chr_val_handle,
     ble_hs_unlock();
 
 done:
-    if (rc != 0) {
-        STATS_INC(ble_gattc_stats, indicate_fail);
+    ble_gattc_process_status(proc, rc);
+
+    if (rc == BLE_HS_EBUSY) {
+        rc = 0;
+    } else {
+        /* Tell the application that an indication transmission was attempted.*/
+        ble_gap_notify_tx_event(rc, conn_handle, chr_val_handle, 1);
     }
 
-    /* Tell the application that an indication transmission was attempted. */
-    ble_gap_notify_tx_event(rc, conn_handle, chr_val_handle, 1);
+    if (rc != 0) {
+        STATS_INC(ble_gattc_stats, indicate_fail);
+        os_mbuf_free_chain(txom);
+    }
 
-    ble_gattc_process_status(proc, rc);
-    os_mbuf_free_chain(txom);
     return rc;
 }
 
@@ -4775,6 +5028,88 @@ int
 ble_gattc_any_jobs(void)
 {
     return !STAILQ_EMPTY(&ble_gattc_procs);
+}
+
+void
+ble_gattc_process_queued_procs(struct ble_gattc_proc *proc) 
+{
+    int rc = 0;
+
+    switch(proc->op) {
+        case BLE_GATT_OP_MTU:
+            rc = ble_gattc_mtu_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_DISC_ALL_SVCS:
+            rc = ble_gattc_disc_all_svcs_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_DISC_SVC_UUID:
+            rc = ble_gattc_disc_svc_uuid_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_FIND_INC_SVCS:
+            rc = ble_gattc_find_inc_svcs_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_DISC_ALL_CHRS:
+            rc = ble_gattc_disc_all_chrs_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_DISC_CHR_UUID:
+            rc = ble_gattc_disc_chr_uuid_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_DISC_ALL_DSCS:
+            rc = ble_gattc_disc_all_dscs_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_READ:
+            rc = ble_gattc_read_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_READ_UUID:
+            rc = ble_gattc_read_uuid_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_READ_LONG:
+            rc = ble_gattc_read_long_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_READ_MULT:
+            rc = ble_gattc_read_mult_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_WRITE:
+            rc = ble_att_clt_tx_write_req(proc->conn_handle,
+                    proc->write.att_handle,
+                    proc->write.om);
+            break;
+			
+        case BLE_GATT_OP_WRITE_LONG:
+            rc = ble_gattc_write_long_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_WRITE_RELIABLE:
+            rc = ble_gattc_write_reliable_tx(proc);
+            break;
+			
+        case BLE_GATT_OP_INDICATE:
+            rc = ble_att_clt_tx_indicate(proc->conn_handle,
+                    proc->indicate.chr_val_handle,
+                    proc->indicate.om);
+            /* Tell the application that an indication
+             * transmission was attempted.
+             * */
+            ble_gap_notify_tx_event(rc, proc->conn_handle,
+                                    proc->indicate.chr_val_handle, 1);
+            break;
+			
+        default:
+            assert(0);
+    }
+	
+    ble_gattc_process_status(proc, rc);
 }
 
 int

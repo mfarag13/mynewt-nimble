@@ -168,6 +168,8 @@ void ble_att_truncate_to_mtu(const struct ble_l2cap_chan *att_chan,
                              struct os_mbuf *txom);
 void ble_att_set_peer_mtu(struct ble_l2cap_chan *chan, uint16_t peer_mtu);
 uint16_t ble_att_chan_mtu(const struct ble_l2cap_chan *chan);
+int ble_att_is_busy(uint16_t conn_handle);
+int ble_att_is_atomic_transaction(uint8_t opcode);
 int ble_att_init(void);
 
 #define BLE_ATT_LOG_CMD(is_tx, cmd_name, conn_handle, log_cb, cmd) \
@@ -185,33 +187,33 @@ ble_att_svr_find_by_uuid(struct ble_att_svr_entry *start_at,
                          const ble_uuid_t *uuid,
                          uint16_t end_handle);
 uint16_t ble_att_svr_prev_handle(void);
-int ble_att_svr_rx_mtu(uint16_t conn_handle, struct os_mbuf **rxom);
+int ble_att_svr_rx_mtu(struct ble_l2cap_chan* chan, struct os_mbuf **rxom);
 struct ble_att_svr_entry *ble_att_svr_find_by_handle(uint16_t handle_id);
 int32_t ble_att_svr_ticks_until_tmo(const struct ble_att_svr_conn *svr,
                                     ble_npl_time_t now);
-int ble_att_svr_rx_find_info(uint16_t conn_handle, struct os_mbuf **rxom);
-int ble_att_svr_rx_find_type_value(uint16_t conn_handle,
+int ble_att_svr_rx_find_info(struct ble_l2cap_chan* chan, struct os_mbuf **rxom);
+int ble_att_svr_rx_find_type_value(struct ble_l2cap_chan* chan,
                                    struct os_mbuf **rxom);
-int ble_att_svr_rx_read_type(uint16_t conn_handle,
+int ble_att_svr_rx_read_type(struct ble_l2cap_chan* chan,
                              struct os_mbuf **rxom);
-int ble_att_svr_rx_read_group_type(uint16_t conn_handle,
+int ble_att_svr_rx_read_group_type(struct ble_l2cap_chan* chan,
                                    struct os_mbuf **rxom);
-int ble_att_svr_rx_read(uint16_t conn_handle,
+int ble_att_svr_rx_read(struct ble_l2cap_chan* chan,
                         struct os_mbuf **rxom);
-int ble_att_svr_rx_read_blob(uint16_t conn_handle,
+int ble_att_svr_rx_read_blob(struct ble_l2cap_chan* chan,
                              struct os_mbuf **rxom);
-int ble_att_svr_rx_read_mult(uint16_t conn_handle,
+int ble_att_svr_rx_read_mult(struct ble_l2cap_chan* chan,
                              struct os_mbuf **rxom);
-int ble_att_svr_rx_write(uint16_t conn_handle,
+int ble_att_svr_rx_write(struct ble_l2cap_chan* chan,
                          struct os_mbuf **rxom);
 int ble_att_svr_rx_write_no_rsp(uint16_t conn_handle, struct os_mbuf **rxom);
-int ble_att_svr_rx_prep_write(uint16_t conn_handle,
+int ble_att_svr_rx_prep_write(struct ble_l2cap_chan* chan,
                               struct os_mbuf **rxom);
-int ble_att_svr_rx_exec_write(uint16_t conn_handle,
+int ble_att_svr_rx_exec_write(struct ble_l2cap_chan* chan,
                               struct os_mbuf **rxom);
 int ble_att_svr_rx_notify(uint16_t conn_handle,
                           struct os_mbuf **rxom);
-int ble_att_svr_rx_indicate(uint16_t conn_handle,
+int ble_att_svr_rx_indicate(struct ble_l2cap_chan* chan,
                             struct os_mbuf **rxom);
 void ble_att_svr_prep_clear(struct ble_att_prep_entry_list *prep_list);
 int ble_att_svr_read_handle(uint16_t conn_handle, uint16_t attr_handle,
@@ -223,7 +225,7 @@ int ble_att_svr_init(void);
 void ble_att_svr_hide_range(uint16_t start_handle, uint16_t end_handle);
 void ble_att_svr_restore_range(uint16_t start_handle, uint16_t end_handle);
 
-int ble_att_svr_tx_error_rsp(uint16_t conn_handle, struct os_mbuf *txom,
+int ble_att_svr_tx_error_rsp(struct ble_l2cap_chan *chan, struct os_mbuf *txom,
                              uint8_t req_op, uint16_t handle,
                              uint8_t error_code);
 /*** $clt */

@@ -93,6 +93,7 @@ typedef int ble_l2cap_tx_fn(struct ble_hs_conn *conn,
                             struct ble_l2cap_chan *chan);
 
 #define BLE_L2CAP_CHAN_F_TXED_MTU       0x01    /* We have sent our MTU. */
+#define BLE_L2CAP_CHAN_BUSY             0x02    /* L2CAP Channel is busy */
 
 SLIST_HEAD(ble_l2cap_chan_list, ble_l2cap_chan);
 

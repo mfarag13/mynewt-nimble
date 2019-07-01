@@ -66,12 +66,19 @@ ble_att_tx(uint16_t conn_handle, struct os_mbuf *txom)
 
     ble_hs_lock();
 
-    ble_hs_misc_conn_chan_find_reqd(conn_handle, BLE_L2CAP_CID_ATT, &conn,
-                                    &chan);
+    ble_att_conn_chan_find(conn_handle, &conn, &chan);
+
     if (chan == NULL) {
         os_mbuf_free_chain(txom);
         rc = BLE_HS_ENOTCONN;
     } else {
+        if (ble_att_is_atomic_transaction(txom->om_data[0])) {
+            /* Set Att Bearer as Busy */
+            chan->flags |= BLE_L2CAP_CHAN_BUSY;
+        } else {
+            /* Clear Busy Flag of the L2CAP Channel */
+            chan->flags &= ~(BLE_L2CAP_CHAN_BUSY);
+        }
         ble_att_truncate_to_mtu(chan, txom);
         rc = ble_l2cap_tx(conn, chan, txom);
     }
